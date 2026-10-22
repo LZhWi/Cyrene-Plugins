@@ -56,7 +56,7 @@
   }
   .field { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
   .field:last-child { margin-bottom: 0; }
-  .field label { width: 64px; flex: none; color: var(--sub); font-size: 12px; }
+  .field label { min-width: 64px; flex: none; color: var(--sub); font-size: 12px; white-space: nowrap; }
   .field input {
     flex: 1;
     border: 1px solid var(--line);
@@ -71,8 +71,12 @@
   .field input:focus { border-color: var(--accent); }
   .field input:disabled { opacity: 0.55; }
   .field input.short { flex: 0 0 90px; }
-  .row { display: flex; gap: 8px; }
-  .row > .field { flex: 1; }
+  /* 窗口只有 460px 宽，三个字段并排会把「协议版本」挤出卡片外框：允许换行，并让输入框可以缩到内容宽度以下。 */
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .row > .field { flex: 1 1 150px; min-width: 0; }
+  .field input { min-width: 0; }
+  .hint { font-size: 11px; color: var(--sub); margin-top: 8px; line-height: 1.5; }
+  .hint code { font-family: Consolas, "Courier New", monospace; font-size: 11px; background: var(--accent-soft); border-radius: 3px; padding: 0 3px; }
   button {
     font: inherit;
     border: none;
@@ -157,7 +161,20 @@
         <label>角色名</label>
         <input id="username" placeholder="Cyrene" maxlength="16" spellcheck="false">
       </div>
+      <div class="field">
+        <label>协议版本</label>
+        <input id="version" class="short" placeholder="留空自动" spellcheck="false">
+      </div>
     </div>
+    <div class="field">
+      <label>服务器密码</label>
+      <input id="password" type="password" placeholder="没有就留空" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>登录命令</label>
+      <input id="loginCommand" placeholder="/serverpass {password}" autocomplete="off" spellcheck="false">
+    </div>
+    <p class="hint">服务器装了 ServerPassword / AuthMe 这类登录插件时才填。密码只在这次连接内存里使用：不写进配置存储、不进日志、不会出现在给模型的聊天上下文里，重开窗口需要再填一次。登录命令里的 <code>{password}</code> 会替换成密码，AuthMe 一般填 <code>/login {password}</code>。</p>
     <div class="actions">
       <button class="btn-primary" id="btnConnect">连接</button>
       <button class="btn-ghost" id="btnDisconnect" disabled>断开</button>
@@ -200,7 +217,8 @@
 
   const els = {
     dot: $("dot"), badge: $("stateBadge"),
-    host: $("host"), port: $("port"), username: $("username"),
+    host: $("host"), port: $("port"), username: $("username"), version: $("version"),
+    password: $("password"), loginCommand: $("loginCommand"),
     btnConnect: $("btnConnect"), btnDisconnect: $("btnDisconnect"), btnStop: $("btnStop"),
     msg: $("msg"),
     stName: $("stName"), stPos: $("stPos"), stHealth: $("stHealth"), stTask: $("stTask"), stGoal: $("stGoal"),
@@ -220,7 +238,7 @@
   }
 
   function setUi(state, busy) {
-    const inputs = [els.host, els.port, els.username];
+    const inputs = [els.host, els.port, els.username, els.version, els.password, els.loginCommand];
     inputs.forEach((el) => { el.disabled = state === "connected" || busy; });
     els.btnConnect.disabled = state === "connected" || busy;
     els.btnDisconnect.disabled = state !== "connected" || busy;
@@ -269,6 +287,9 @@
         host,
         port: Number.isFinite(port) ? port : 25565,
         username: username || "Cyrene",
+        version: els.version.value.trim(),
+        password: els.password.value,
+        loginCommand: els.loginCommand.value.trim(),
       });
       showMessage("ok", "连接成功，已在游戏里上线");
     } catch (err) {
@@ -308,6 +329,7 @@
         els.host.value = cfg.host ?? "";
         els.port.value = cfg.port ?? "";
         els.username.value = cfg.username ?? "Cyrene";
+        els.version.value = cfg.version ?? "";
       } else {
         els.username.value = "Cyrene";
       }
@@ -329,6 +351,9 @@
     els.host.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
     els.port.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
     els.username.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+    els.version.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+    els.password.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+    els.loginCommand.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
     refresh();
     setInterval(refresh, 2000);
   }
