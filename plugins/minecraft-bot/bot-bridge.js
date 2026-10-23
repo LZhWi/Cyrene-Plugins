@@ -100,7 +100,8 @@ class BotBridge {
     connectRejecter = null;
     connectTimer = null;
     constructor(log) {
-        this.log = log;
+        // 包一层：19 处日志调用点全部经过脱敏，新增调用点也不会漏
+        this.log = (line) => log(this.redactSecret(line));
     }
     /** 订阅游戏聊天（玩家发言，不含机器人自己）。返回退订函数。 */
     onChat(fn) {
@@ -465,14 +466,21 @@ class BotBridge {
                 break;
         }
     }
+    /** 服务器密码只在内存里（this.opts.password），任何进日志、进聊天缓存、进模型上下文的内容都先洗一遍。 */
+    redactSecret(value) {
+        const secret = this.opts?.password;
+        const text = String(value ?? "");
+        return secret ? text.split(secret).join("***") : text;
+    }
     pushChat(player, message) {
-        this.recentChat.push({ player, message, at: Date.now() });
+        const safe = this.redactSecret(message);
+        this.recentChat.push({ player, message: safe, at: Date.now() });
         if (this.recentChat.length > 50)
             this.recentChat.shift();
-        this.log(`[游戏聊天] ${player}: ${message}`);
+        this.log(`[游戏聊天] ${player}: ${safe}`);
         for (const fn of [...this.chatListeners]) {
             try {
-                fn(player, message);
+                fn(player, safe);
             }
             catch (err) {
                 this.log(`聊天订阅者处理出错: ${err instanceof Error ? err.message : String(err)}`);
@@ -525,7 +533,7 @@ class BotBridge {
         this.connectTimer = setTimeout(() => {
             this.failConnect(new Error(`连接超时（${CONNECT_TIMEOUT_MS / 1000} 秒内未完成登录）`));
         }, CONNECT_TIMEOUT_MS);
-        if (!this.send({ type: "connect", host: opts.host, port: opts.port, username: opts.username })) {
+        if (!this.send({ type: "connect", host: opts.host, port: opts.port, username: opts.username, version: opts.version, password: opts.password, loginCommand: opts.loginCommand })) {
             this.failConnect(new Error("无法向机器人子进程写入指令"));
         }
         try {

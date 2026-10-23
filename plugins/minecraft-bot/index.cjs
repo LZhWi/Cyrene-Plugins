@@ -138,6 +138,7 @@ const plugin = {
                         host: { type: "string", description: "服务器地址，如 localhost 或 192.168.1.100" },
                         port: { type: "number", description: "服务器端口，默认 25565" },
                         username: { type: "string", description: "你在游戏里的角色名，默认 Cyrene" },
+                        protocolVersion: { type: "string", description: "可选：锁定机器人使用的协议版本，如 \"26.3\"；留空则自动协商。服务端比当前依赖库新（例如 26.3）时填它更稳" },
                     },
                     required: ["host"],
                 },
@@ -145,9 +146,10 @@ const plugin = {
                     const host = String(args.host ?? "localhost").trim();
                     const port = Number(args.port) || 25565;
                     const username = String(args.username ?? "Cyrene").trim() || "Cyrene";
+                    const version = String(args.protocolVersion ?? "").trim() || undefined;
                     if (username.length > 16)
                         throw new Error("游戏角色名不能超过 16 个字符");
-                    const s = await bridge.connect({ host, port, username });
+                    const s = await bridge.connect({ host, port, username, version });
                     // 已保存的胆小偏好在每次连接后自动下发
                     await applyCowardiceAfterConnect();
                     return `你已进入服务器 ${host}:${port}，游戏角色名 ${username}。\n${formatStatus(s)}`;
@@ -191,7 +193,7 @@ const plugin = {
                 id: "minecraft-bot_say",
                 enabled: true,
                 name: "在游戏里说话",
-                description: "用你的游戏身体在聊天栏说一句话。",
+                description: "用你的游戏身体在聊天栏说话。这条会广播给服务器上所有能看到聊天的玩家，不是私聊；markdown 会被洗成纯文本，超过一行会自动折行分条发出。",
                 risk: "safe",
                 effectKind: "mutation",
                 inputSchema: {
@@ -204,10 +206,15 @@ const plugin = {
                     const message = String(args.message ?? "").trim();
                     if (!message)
                         throw new Error("消息内容不能为空");
-                    if (message.length > 256)
-                        throw new Error("游戏聊天单条最长 256 字符");
-                    bridge.say(message);
-                    return `你已在游戏里说: ${message}`;
+                    const lines = channel_1.wrapForGameChat(message).slice(0, 6);
+                    if (lines.length === 0)
+                        throw new Error("消息清洗后为空");
+                    for (let i = 0; i < lines.length; i++) {
+                        if (i > 0)
+                            await new Promise((r) => setTimeout(r, 350));
+                        bridge.say(lines[i]);
+                    }
+                    return `你已在游戏里说: ${lines.join(" / ")}`;
                 },
             },
             {
@@ -825,10 +832,24 @@ const plugin = {
                 throw new Error("请填写服务器地址");
             const port = Number(input.port) || 25565;
             const username = String(input.username ?? "Cyrene").trim() || "Cyrene";
+            const version = String(input.version ?? "").trim() || undefined;
             if (username.length > 16)
                 throw new Error("游戏角色名不能超过 16 个字符");
-            const snapshot = await bridge.connect({ host, port, username });
-            ctx.storage.set(LAST_CONFIG_KEY, { host, port, username });
+            // 密码只在本次连接的内存里：既不进 ctx.storage（宿主插件存储是明文 JSON），也不回显
+            const password = String(input.password ?? "");
+            const loginCommand = String(input.loginCommand ?? "").trim() || undefined;
+            if (password.length > 64)
+                throw new Error("服务器密码最长 64 个字符");
+            if (loginCommand && !loginCommand.startsWith("/"))
+                throw new Error("登录命令要以 / 开头，例如 /serverpass {password}");
+            if (loginCommand && loginCommand.length > 96)
+                throw new Error("登录命令最长 96 个字符");
+            const snapshot = await bridge.connect({
+                host, port, username, version,
+                ...(password ? { password } : {}),
+                ...(loginCommand ? { loginCommand } : {}),
+            });
+            ctx.storage.set(LAST_CONFIG_KEY, { host, port, username, version });
             // 已保存的胆小偏好在每次连接后自动下发
             await applyCowardiceAfterConnect();
             return snapshot;

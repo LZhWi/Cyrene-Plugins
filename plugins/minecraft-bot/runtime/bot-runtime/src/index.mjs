@@ -21,7 +21,7 @@ function send(msg) {
 
 /** 诊断日志走协议通道，宿主统一打印。 */
 function log(message) {
-  send({ type: "log", message: String(message) });
+  send({ type: "log", message: redact(message) });
 }
 
 /** kicked/end 事件里的原因可能是字符串或富文本对象，统一转成可读文本。 */
@@ -55,6 +55,79 @@ let stayTimer = null;
 let invTimer = null;
 /** 上次上报的背包 JSON，用于去重（内容没变就不发）。 */
 let lastInvJson = "";
+/** 密码登录插件（ServerPassword / AuthMe 等）的凭据，只存在于内存，绝不写日志或落盘。 */
+let loginSpec = null;
+/** 是否已经出生：密码登录插件通常不让你进世界，出生即到不了这一步。 */
+let spawnedOk = false;
+/** 登录命令补发计时器。 */
+let loginTimer = null;
+/** 默认登录命令模板；{password} 会被替换成实际密码。 */
+const DEFAULT_LOGIN_COMMAND = "/serverpass {password}";
+/**
+ * 登录命令的发送时刻（相对 login 事件的毫秒数）。在 login 事件当口发出去的命令包会被服务端丢掉，
+ * 实测 26.3 原版服上晚 1—8 秒发都有效，所以最早一次排在 2 秒，之后按这个表补发。
+ */
+const LOGIN_SEND_AT_MS = [2000, 4000, 7000, 11000, 16000];
+
+/** 把可能混进密码的文本洗成可安全外发的形式。 */
+function redact(value) {
+  const secret = loginSpec?.password;
+  const text = String(value ?? "");
+  return secret ? text.split(secret).join("***") : text;
+}
+
+/** 渲染登录命令：模板含 {password} 就替换，否则把命令当前缀追加密码。 */
+function renderLoginCommand() {
+  if (!loginSpec?.password)
+    return null;
+  const tpl = String(loginSpec.loginCommand || DEFAULT_LOGIN_COMMAND).trim();
+  return tpl.includes("{password}")
+    ? tpl.replace(/\{password\}/g, loginSpec.password)
+    : `${tpl} ${loginSpec.password}`;
+}
+
+function sendLogin(why) {
+  const command = renderLoginCommand();
+  if (!command || !bot)
+    return;
+  try {
+    bot.chat(command);
+    log(`已发送登录命令（${why}）`);
+  }
+  catch (error) {
+    log(`登录命令发送失败（${why}）: ${redact(error?.message ?? error)}`);
+  }
+}
+
+function stopLoginRetry() {
+  if (loginTimer) {
+    clearTimeout(loginTimer);
+    loginTimer = null;
+  }
+}
+
+/**
+ * 登录插件不会回一个"认证通过"的事件。第一次发送不看出生（AuthMe 这类是先放行进世界、
+ * 再冻结操作，等出生信号就永远不会发），之后只在还没出生时补发。
+ */
+function startLoginRetry() {
+  stopLoginRetry();
+  if (!loginSpec?.password)
+    return;
+  let index = 0;
+  const step = () => {
+    loginTimer = null;
+    if (!bot)
+      return;
+    if (index > 0 && spawnedOk)
+      return;
+    sendLogin(`第 ${index + 1} 次`);
+    index++;
+    if (index < LOGIN_SEND_AT_MS.length)
+      loginTimer = setTimeout(step, LOGIN_SEND_AT_MS[index] - LOGIN_SEND_AT_MS[index - 1]);
+  };
+  loginTimer = setTimeout(step, LOGIN_SEND_AT_MS[0]);
+}
 
 /** 把背包快照推给宿主；内容有变化才发送，宿主用它做聊天情境注入。 */
 function pushInventory() {
@@ -106,12 +179,62 @@ function stopTask(reason) {
   currentTask = null;
 }
 
+/**
+ * 没指定协议版本时先用 SLP 探一下服务端自报的版本，挑一个依赖库认识的协议去连。
+ * 目的不是省事，是把兼容面做到最大：已知版本直接锁定（比握手更准），
+ * 比已知最新的还新的服务端（比如未来的 26.4/27.x）退到已知最新协议试连，
+ * 其它情况才交给自动协商。
+ */
+async function pickProtocol(host, port) {
+  const mc = require("minecraft-protocol");
+  const table = require("minecraft-protocol/src/version.js");
+  const known = table.supportedVersions;
+  const newest = known[known.length - 1];
+  let info;
+  try {
+    info = await new Promise((resolve, reject) => {
+      mc.ping({ host, port, version: newest, timeout: 5000 }, (err, res) => (err ? reject(err) : resolve(res)));
+    });
+  } catch (err) {
+    log(`版本探测失败（${String(err?.message ?? err).slice(0, 90)}），改回自动协商`);
+    return false;
+  }
+  const name = info?.version?.name;
+  const proto = Number(info?.version?.protocol) || 0;
+  if (!proto) {
+    log(`版本探测没返回协议号（自报 ${name ?? "空"}），交给自动协商`);
+    return false;
+  }
+  // 关键：以协议号为准。Paper 报 "Paper 26.3"、某些套件报 "1.20.6-" 或自带前缀，
+  // 拿名字比对必然失配；协议号才是 mineflayer 真正需要的东西。
+  const byProto = new Map((require("minecraft-data").versions.pc ?? []).map((v) => [v.version, v.minecraftVersion]));
+  const newestProto = require("minecraft-data")(newest)?.version?.version ?? 0;
+  const exact = byProto.get(proto);
+  if (exact && known.includes(exact)) {
+    log(`探测到协议 ${proto} → 版本 ${exact}（服务端自报 ${name}），按该版本连接`);
+    return exact;
+  }
+  if (proto > newestProto) {
+    log(`服务端自报 ${name}（协议 ${proto}），比本构建已知的 ${newest}（协议 ${newestProto}）更新：按 ${newest} 试连，若出现方块 id 错位或寻路异常，需等上游补齐该版本数据`);
+    return newest;
+  }
+  const loose = String(name ?? "").match(/(\d+\.\d+(?:\.\d+)?)/)?.[1];
+  if (loose && known.includes(loose)) {
+    log(`协议 ${proto} 未收录，但自报名称含 ${loose}，按 ${loose} 试连`);
+    return loose;
+  }
+  log(`服务端 ${name ?? "?"}（协议 ${proto}）无法映射到已知版本，交给自动协商`);
+  return false;
+}
+
 /** 建立 mineflayer 连接并挂载所有事件转发。 */
-function connect({ host, port, username }) {
+async function connect({ host, port, username, version, password, loginCommand }) {
   if (bot) {
     log("已有连接，忽略重复 connect 指令");
     return;
   }
+  loginSpec = String(password ?? "").length > 0 ? { password: String(password), loginCommand } : null;
+  spawnedOk = false;
   const mineflayer = require("mineflayer");
   const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
   const { plugin: collectBlockPlugin } = require("mineflayer-collectblock");
@@ -125,18 +248,43 @@ function connect({ host, port, username }) {
     log(`host 参数带端口，已拆分为 ${realHost}:${realPort}`);
   }
   send({ type: "connecting" });
+  const wanted = String(version ?? "").trim();
+  const protocol = wanted || (await pickProtocol(realHost, realPort));
   bot = mineflayer.createBot({
     host: realHost,
     port: realPort,
     username,
-    // 不锁定协议版本，由 mineflayer 根据服务器握手自动协商
-    version: false,
+    // 优先用调用方指定的版本；没指定时用探测结果；探测不出来才交给自动协商
+    version: protocol || false,
     // 离线模式（局域网/离线服务器）；正版验证需要额外的微软登录流程，暂不支持
     auth: "offline",
   });
 
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlockPlugin);
+
+  // 26.3 起原版服务端限制“每个 tick 只允许一个带位置的包”，收到 tick_end 才复位计数。
+  // 出生/传送的那一个 tick 里 mineflayer 会连发多个（teleport_confirm、position_look、
+  // position），第三个包就撞线被踢 invalid_player_movement。这里补一层限速：同一个 tick 内
+  // 要发第二个带位置的包之前，先补一个 tick_end 把计数清零。
+  const positionedPackets = new Set(["position", "position_look", "teleport_confirm", "accept_teleportation"]);
+  bot.once("connect", () => {
+    if (!bot.supportFeature("sendsClientTickEndPacket")) return; // 旧协议不发 tick_end，不介入
+    const write = bot._client.write.bind(bot._client);
+    let sentThisTick = false;
+    bot._client.write = (name, data) => {
+      if (name === "tick_end") {
+        sentThisTick = false;
+      } else if (positionedPackets.has(name)) {
+        if (sentThisTick) {
+          write("tick_end", {});
+          sentThisTick = false;
+        }
+        sentThisTick = true;
+      }
+      return write(name, data);
+    };
+  });
 
   // 背包快照定时上报（3 秒查一次，内容变了才发）
   invTimer = setInterval(pushInventory, 3000);
@@ -147,8 +295,11 @@ function connect({ host, port, username }) {
   bot.once("login", () => {
     loggedIn = true;
     send({ type: "connected", username: bot.username });
+    startLoginRetry();
   });
   bot.on("spawn", () => {
+    // 能出生就说明认证这一关过了；只停掉后续补发，已排定的首次发送照发（AuthMe 是先放行再冻结）
+    spawnedOk = true;
     // 每次重生重置默认移动参数（允许挖方块、允许游泳等交给上层配置，这里用默认）
     bot.pathfinder.setMovements(new Movements(bot));
     sendSpawn();
@@ -158,11 +309,12 @@ function connect({ host, port, username }) {
   bot.on("chat", (player, message) => {
     // 过滤自己发出的聊天，避免宿主收到回声
     if (player === bot.username) return;
-    send({ type: "chat", player, message });
+    // 部分登录插件会把命令原文回显到聊天栏，这里必须洗掉密码再交给宿主
+    send({ type: "chat", player, message: redact(message) });
   });
   bot.on("whisper", (player, message) => {
     if (player === bot.username) return;
-    send({ type: "chat", player, message: `(私聊) ${message}` });
+    send({ type: "chat", player, message: redact(`(私聊) ${message}`) });
   });
   bot.on("health", () => send({ type: "health", health: bot.health, food: bot.food }));
   bot.on("move", () => {
@@ -191,6 +343,8 @@ function connect({ host, port, username }) {
     bot = null;
     currentTask = null;
     collecting = false;
+    spawnedOk = false;
+    stopLoginRetry();
     modes.stop();
     if (invTimer) {
       clearInterval(invTimer);
@@ -1049,6 +1203,7 @@ function shutdown() {
     clearInterval(invTimer);
     invTimer = null;
   }
+  stopLoginRetry();
   if (bot) {
     try { bot.quit(); } catch { /* 连接已断开时退出会抛错，忽略即可 */ }
     bot = null;
@@ -1088,7 +1243,7 @@ lines.on("line", (line) => {
   }
   try {
     if (msg.type === "connect") {
-      connect(msg);
+      connect(msg).catch((err) => send({ type: "connect_error", error: String(err?.message ?? err) }));
     } else if (msg.type === "say") {
       if (!bot) {
         send({ type: "say_result", ok: false, error: "机器人未连接" });
